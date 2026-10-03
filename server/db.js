@@ -699,6 +699,32 @@ function backfillWorkOrderDispatchState() {
 }
 backfillWorkOrderDispatchState()
 
+// 历史数据清理（幂等）：早期版本删除危机时未级联通知任务，遗留的孤儿任务会继续被调度发送（幽灵提醒）并污染统计。
+// 口径与 notify.js deleteNotifyOfCrisis 一致：来源对象已删除的任务（工单链路/危机状态类/升级链孤儿）连同留痕删除；
+// 来源对象保留的任务（预警/传播/外部协作类）仅解除危机引用。
+function migrateOrphanNotifyTasks() {
+  const sweep = (where) => {
+    const ids = db.prepare(`SELECT id FROM notify_tasks WHERE ${where}`).all().map((r) => r.id)
+    if (!ids.length) return 0
+    const ph = ids.map(() => '?').join(',')
+    db.prepare(`DELETE FROM notify_logs WHERE task_id IN (${ph})`).run(...ids)
+    return Number(db.prepare(`DELETE FROM notify_tasks WHERE id IN (${ph})`).run(...ids).changes || 0)
+  }
+  // ① 工单链路孤儿（工单已随危机删除）
+  sweep('work_order_id IS NOT NULL AND work_order_id NOT IN (SELECT id FROM work_orders)')
+  // ② 危机状态类孤儿（危机已删除）
+  sweep("kind='crisis' AND crisis_id IS NOT NULL AND crisis_id NOT IN (SELECT id FROM crisis)")
+  // ③ 升级链孤儿（父任务已删除；链深 1，循环兜底历史异常数据）
+  for (;;) {
+    if (!sweep('escalated_from IS NOT NULL AND escalated_from NOT IN (SELECT id FROM notify_tasks)')) break
+  }
+  // ④ 来源对象保留的任务：解除已删除危机的引用
+  db.prepare('UPDATE notify_tasks SET crisis_id=NULL WHERE crisis_id IS NOT NULL AND crisis_id NOT IN (SELECT id FROM crisis)').run()
+  // ⑤ 兜底：无任务归属的留痕
+  db.prepare('DELETE FROM notify_logs WHERE task_id NOT IN (SELECT id FROM notify_tasks)').run()
+}
+migrateOrphanNotifyTasks()
+
 // 迁移：早期版本 import_job_items.idem_key 为全局唯一，跨任务内容去重时同名键会冲突，
 // 重建表去掉该唯一约束（保留 (job_id, seq) 唯一与普通索引）。
 function migrateJobItemsKeyUnique() {

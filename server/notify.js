@@ -448,6 +448,43 @@ export function ackTask(id, actor, note = '') {
   return { ok: true, resolved, crisisId, task: getTask(id) }
 }
 
+// ===== 危机删除级联（由 index.js 危机删除链路调用，与删除同事务） =====
+// 口径与危机删除的整体哲学一致——来源对象随事件删除的任务一并删除，来源对象保留的任务仅解除危机引用：
+// ① 工单链路任务（work_order_id 命中该危机工单）：工单随事件删除，任务留存即成幽灵提醒并被调度器继续发送；
+// ② 危机状态类任务（kind='crisis'）：来源即危机本身；
+// ③ 升级链孤儿（escalated_from 指向被删任务）：父任务不存，子任务一并删除；
+// ④ 预警/传播/外部协作类任务：触发记录/路径/外部提交均保留（仅解除危机引用），任务同步解除危机引用——
+//    既不残留已删危机的幽灵引用，也避免重启补生成（seed*）把任务再次复活；
+// 任务留痕（notify_logs）随任务删除。返回 { deleted, detached }。
+export function deleteNotifyOfCrisis(crisisId) {
+  const delIds = new Set()
+  for (const r of q("SELECT id FROM notify_tasks WHERE crisis_id=? AND kind='crisis'", crisisId)) delIds.add(r.id)
+  const woIds = q('SELECT id FROM work_orders WHERE crisis_id=?', crisisId).map((r) => r.id)
+  if (woIds.length) {
+    const ph = woIds.map(() => '?').join(',')
+    for (const r of q(`SELECT id FROM notify_tasks WHERE work_order_id IN (${ph})`, ...woIds)) delIds.add(r.id)
+  }
+  // 升级链孤儿：被删任务的升级子任务一并删除（链深 1，循环兜底历史异常数据）
+  for (;;) {
+    const ids = [...delIds]
+    if (!ids.length) break
+    const ph = ids.map(() => '?').join(',')
+    const fresh = q(`SELECT id FROM notify_tasks WHERE escalated_from IN (${ph})`, ...ids).filter((r) => !delIds.has(r.id))
+    if (!fresh.length) break
+    for (const r of fresh) delIds.add(r.id)
+  }
+  let deleted = 0
+  if (delIds.size) {
+    const ids = [...delIds]
+    const ph = ids.map(() => '?').join(',')
+    run(`DELETE FROM notify_logs WHERE task_id IN (${ph})`, ...ids)
+    deleted = Number(run(`DELETE FROM notify_tasks WHERE id IN (${ph})`, ...ids).changes || 0)
+  }
+  // 来源对象保留的任务：解除危机引用（与 alert_events/prop_paths/ext_submissions 的 detach 口径一致）
+  const detached = Number(run('UPDATE notify_tasks SET crisis_id=NULL WHERE crisis_id=?', crisisId).changes || 0)
+  return { deleted, detached }
+}
+
 // ===== 配置（渠道 + 订阅） =====
 export function listConfig() {
   const channels = q('SELECT * FROM notify_channels ORDER BY id')

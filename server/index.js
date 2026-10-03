@@ -10,7 +10,7 @@ import {
   actorOf, permit, ROLE_TEXT, CHANNEL_TYPES, TASK_STATUS, CRISIS_STATUS_TEXT,
   listConfig, validateChannel, validateSub, listTasks, getTask,
   pauseTask, resumeTask, retryTask, cancelTask, ackTask, listLogs,
-  generateForCrisisStatus, seedNotifyTasks, startScheduler
+  generateForCrisisStatus, seedNotifyTasks, startScheduler, deleteNotifyOfCrisis
 } from './notify.js'
 import {
   SOURCE_TYPES, COLLECT_STATUS, listSources, listRuns, validateSource,
@@ -567,24 +567,37 @@ app.post('/api/crisis/:id/reopen', (req, res) => {
   res.json({ ok: true, restored, status: backTo })
 })
 app.delete('/api/crisis/:id', (req, res) => {
-  run('DELETE FROM crisis_alerts WHERE crisis_id=?', req.params.id)
-  run('UPDATE alert_events SET crisis_id=NULL WHERE crisis_id=?', req.params.id)
-  run('DELETE FROM crisis_timeline WHERE crisis_id=?', req.params.id)
-  run('DELETE FROM crisis_closures WHERE crisis_id=?', req.params.id)
-  // 复盘报告随事件删除（版本归档与操作留痕一并清理）
-  deleteReportsOfCrisis(+req.params.id)
-  // 协同工单随事件删除（工单日志一并清理）
-  const woIds = q('SELECT id FROM work_orders WHERE crisis_id=?', req.params.id).map((r) => r.id)
-  for (const wid of woIds) run('DELETE FROM work_order_logs WHERE wo_id=?', wid)
-  run('DELETE FROM work_orders WHERE crisis_id=?', req.params.id)
-  // 危机声明随事件删除（分渠道登记与声明留痕一并清理）
-  deleteStatementsOfCrisis(+req.params.id)
-  // 外部协作提交保留（外部方提交的证据/进度是跨主体留痕），仅解除危机与工单引用
-  detachSubmissionsOfCrisis(+req.params.id)
-  // 传播路径保留（沉淀的来源/节点/转发关系不随事件删除），仅解除危机引用
-  run('UPDATE prop_paths SET crisis_id=NULL WHERE crisis_id=?', req.params.id)
-  run('DELETE FROM crisis WHERE id=?', req.params.id)
-  res.json({ ok: true })
+  const cid = +req.params.id
+  let notifyClean = { deleted: 0, detached: 0 }
+  // 整条删除链路事务化：危机、时间线、结案档案、复盘报告、工单、声明与通知任务级联要么全部生效，要么整体回滚
+  db.exec('BEGIN')
+  try {
+    run('DELETE FROM crisis_alerts WHERE crisis_id=?', cid)
+    run('UPDATE alert_events SET crisis_id=NULL WHERE crisis_id=?', cid)
+    run('DELETE FROM crisis_timeline WHERE crisis_id=?', cid)
+    run('DELETE FROM crisis_closures WHERE crisis_id=?', cid)
+    // 复盘报告随事件删除（版本归档与操作留痕一并清理）
+    deleteReportsOfCrisis(cid)
+    // 通知任务级联（须在工单删除前执行，按工单归属识别任务）：工单链路/危机状态类任务随事件删除，
+    // 预警/传播/外部协作类任务仅解除危机引用（来源对象保留）——不留幽灵任务，调度器不再发送，统计同步扣减
+    notifyClean = deleteNotifyOfCrisis(cid)
+    // 协同工单随事件删除（工单日志一并清理）
+    const woIds = q('SELECT id FROM work_orders WHERE crisis_id=?', cid).map((r) => r.id)
+    for (const wid of woIds) run('DELETE FROM work_order_logs WHERE wo_id=?', wid)
+    run('DELETE FROM work_orders WHERE crisis_id=?', cid)
+    // 危机声明随事件删除（分渠道登记与声明留痕一并清理）
+    deleteStatementsOfCrisis(cid)
+    // 外部协作提交保留（外部方提交的证据/进度是跨主体留痕），仅解除危机与工单引用
+    detachSubmissionsOfCrisis(cid)
+    // 传播路径保留（沉淀的来源/节点/转发关系不随事件删除），仅解除危机引用
+    run('UPDATE prop_paths SET crisis_id=NULL WHERE crisis_id=?', cid)
+    run('DELETE FROM crisis WHERE id=?', cid)
+    db.exec('COMMIT')
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
+    return res.status(500).json({ error: String(e.message || e) })
+  }
+  res.json({ ok: true, notify: notifyClean })
 })
 
 // ===== 权限守卫（演示）：viewer 只读 / ops 任务操作 / admin 配置 =====
