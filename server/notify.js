@@ -282,9 +282,23 @@ function attemptSend(t) {
   }
 }
 
+// 主体存在性守卫：危机/工单删除后，残留的 crisis/workorder 类任务（理论上已被 purgeCrisisNotify 清理，
+// 此处兜底删除与调度竞态）不得再超时升级、再生成升级子任务；直接置为已取消并留痕，杜绝幽灵升级。
+function subjectAlive(t) {
+  if (t.kind === 'crisis') return !!q1('SELECT 1 FROM crisis WHERE id=?', t.crisis_id)
+  if (t.work_order_id != null) return !!q1('SELECT 1 FROM work_orders WHERE id=?', t.work_order_id)
+  return true
+}
+
 // 回执超时升级：原任务标记已升级，向升级渠道生成【升级】任务（升级任务不再二次升级），并写危机时间线
 function escalateTask(t) {
   const ts = now()
+  if (!subjectAlive(t)) {
+    run("UPDATE notify_tasks SET status='cancelled', updated=? WHERE id=? AND status='sent'", ts, t.id)
+    run('INSERT INTO notify_logs (task_id,action,detail,operator,time) VALUES (?,?,?,?,?)',
+      t.id, 'cancelled', '关联危机/工单已删除，未完成回执的任务自动终止', '系统', ts)
+    return
+  }
   db.exec('BEGIN')
   try {
     const r = run(`UPDATE notify_tasks SET escalated=1, status='escalated', updated=? WHERE id=? AND escalated=0 AND status='sent'`, ts, t.id)
@@ -446,6 +460,41 @@ export function ackTask(id, actor, note = '') {
     throw e
   }
   return { ok: true, resolved, crisisId, task: getTask(id) }
+}
+
+// ===== 删除危机时的通知一致性清理（危机删除、通知调度、工单、复盘快照同口径） =====
+// ① 随危机/工单一并消亡的任务（kind=crisis/workorder，含其回执升级子任务）：连同通知留痕硬删除——
+//    调度器不再扫描发送/重试/超时升级，通知中心不再展示，总览/复盘统计不再计入（避免幽灵提醒与统计失真）。
+// ② 来源实体保留的任务（kind=alert 预警触发 / prop 传播路径 / ext 外部提交）：其来源行在删除链路中仅解除
+//    危机引用（alert_events/prop_paths/ext_submissions 均保留），故任务保留、继续正常调度，仅同步解除
+//    crisis_id / work_order_id 关联，与来源实体的解绑口径保持一致（启动幂等补生成 seedNotifyTasks 也依赖此口径）。
+// workOrderIds：本次随危机删除的工单 id（危机类任务无工单归属；工单类任务以此兜底，防止漏网）。
+export function purgeCrisisNotify(crisisId, workOrderIds = []) {
+  const woIds = [...new Set((workOrderIds || []).map(Number).filter(Number.isInteger))]
+  let tasks
+  if (woIds.length) {
+    const ph = woIds.map(() => '?').join(',')
+    tasks = q(`SELECT id,kind,work_order_id FROM notify_tasks WHERE crisis_id=? OR work_order_id IN (${ph})`, crisisId, ...woIds)
+  } else {
+    tasks = q('SELECT id,kind,work_order_id FROM notify_tasks WHERE crisis_id=?', crisisId)
+  }
+  // 主体已删的任务硬删除；其余（来源保留：预警/传播/外部提交）解绑保留
+  const removeIds = tasks.filter((t) => t.kind === 'crisis' || t.kind === 'workorder').map((t) => t.id)
+  const detachIds = tasks.filter((t) => !removeIds.includes(t.id)).map((t) => t.id)
+
+  const chunk = function* (ids, n) { for (let i = 0; i < ids.length; i += n) yield ids.slice(i, i + n) }
+  for (const ids of chunk(removeIds, 500)) {
+    const ph = ids.map(() => '?').join(',')
+    run(`DELETE FROM notify_logs WHERE task_id IN (${ph})`, ...ids)
+    run(`DELETE FROM notify_tasks WHERE id IN (${ph})`, ...ids)
+  }
+  for (const ids of chunk(detachIds, 500)) {
+    const ph = ids.map(() => '?').join(',')
+    // 来源实体保留，继续正常调度：危机引用解除；工单引用一并解除
+    // （ext 外部提交任务与 ext_submissions 同口径；alert/prop 本无工单归属）
+    run(`UPDATE notify_tasks SET crisis_id=NULL, work_order_id=NULL WHERE id IN (${ph})`, ...ids)
+  }
+  return { removed: removeIds.length, detached: detachIds.length }
 }
 
 // ===== 配置（渠道 + 订阅） =====
